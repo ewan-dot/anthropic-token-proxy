@@ -81,6 +81,95 @@ DAILY_BUDGET_USD = float(os.getenv("DAILY_BUDGET_USD", "50.0"))  # Above this �
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("proxy")
 
+# ---- Prompt injection detection --------------------------------------------
+# Alert-only — never blocks a call. Visible at GET /proxy/security.
+
+_INJECTION_COMPILED = [
+    re.compile(p, re.IGNORECASE) for p in [
+        # Instruction override
+        r"ignore (all |the |your |previous |prior |above |earlier )?instructions",
+        r"disregard (all |the |your |previous |prior |above |earlier )?instructions",
+        r"forget (everything|all|your instructions|the above)",
+        r"your (new |real |true |actual )?instructions (are|say|tell)",
+        r"(you are|you're) (now|actually|really|secretly) (a|an|the)",
+        r"new (task|role|persona|system prompt):",
+        r"pretend (you are|to be) (a|an)",
+        # System prompt extraction
+        r"(show|print|reveal|repeat|display|output) (your |the )?(system prompt|hidden instructions|real instructions)",
+        r"what (is your|are your) (system prompt|instructions|rules|true purpose)",
+        r"(repeat|echo) (everything|all text) (above|before this)",
+        # Jailbreaks
+        r"\bDAN\b",
+        r"developer mode",
+        r"jailbreak",
+        # Prompt delimiter injection
+        r"</?(system|s|inst|instruction)>",
+        r"\[/?INST\]",
+        r"<\|im_start\|>|<\|im_end\|>",
+        r"###\s*(human|assistant|system|instruction)\b",
+        r"<</?SYS>>",
+        # Exfiltration via tool calls / URLs
+        r"(send|post|put|exfiltrate|leak).{0,30}(api key|secret|token|password|credentials)",
+        r"(http|https)://(?!api\.anthropic\.com).{0,50}(key|token|secret|password)",
+    ]
+]
+
+_injection_log: list = []
+
+def _scan_for_injection(body: dict) -> Optional[dict]:
+    """
+    Scan user messages for prompt injection patterns.
+    Only scans role=user content — system content is ours.
+    Returns detection dict if found, None if clean.
+    """
+    messages = body.get("messages", [])
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        if not content:
+            continue
+        content_lower = content.lower()
+        for pattern in _INJECTION_COMPILED:
+            m = pattern.search(content_lower)
+            if m:
+                return {
+                    "message_index": i,
+                    "pattern": pattern.pattern,
+                    "match": m.group(0),
+                    "content_preview": content[:200],
+                }
+    return None
+
+def _alert_injection(details: dict, tool: str):
+    entry = {
+        "ts": datetime.utcnow().isoformat(),
+        "tool": tool,
+        **details,
+    }
+    _injection_log.append(entry)
+    # Keep last 100
+    if len(_injection_log) > 100:
+        _injection_log.pop(0)
+    log.warning(
+        f"[INJECTION DETECTED] tool={tool} "
+        f"pattern='{details['pattern'][:50]}' "
+        f"match='{details['match']}'"
+    )
+    _send_telegram(
+        f"🚨 *Prompt injection detected*\n"
+        f"Tool: `{tool}`\n"
+        f"Pattern: `{details['pattern'][:60]}`\n"
+        f"Match: `{details['match']}`\n"
+        f"Preview: `{details['content_preview'][:120]}`\n"
+        f"_Alert-only — call was not blocked_"
+    )
+
 # ---- Model pricing (USD per token) ----------------------------------------
 
 HAIKU = "claude-haiku-4-5-20251001"
@@ -604,6 +693,15 @@ async def proxy_costs(days: int = 7, group_by: str = "model"):
         "breakdown": sorted_breakdown,
     }
 
+@app.get("/proxy/security")
+async def proxy_security():
+    """Injection detection log. Shows last 100 detected attempts."""
+    return {
+        "total_detected": len(_injection_log),
+        "patterns_active": len(_INJECTION_COMPILED),
+        "recent": _injection_log[-10:] if _injection_log else [],
+    }
+
 @app.post("/v1/messages")
 async def proxy_messages(request: Request):
     """
@@ -623,6 +721,11 @@ async def proxy_messages(request: Request):
 
     is_stream = body.get("stream", False)
     tool = _identify_tool(request, body)
+
+    # ---- 0. Prompt injection detection (alert-only) ----
+    injection = _scan_for_injection(body)
+    if injection:
+        _alert_injection(injection, tool)
 
     # ---- 1. Model routing — downgrade Sonnet→Haiku when safe ----
     routed_model, original_model, routing_reason = _route_model(body)
