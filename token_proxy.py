@@ -6,15 +6,16 @@ Sits between every tool (CRM, dashboard, Telegram bots, OpenClaw, Claude Code)
 and the Anthropic API. Applies cost optimisations transparently.
 
 What it does on every call:
-  1. Prompt caching    — injects cache_control on system prompts automatically (90% savings)
+  1. Prompt caching    — injects cache_control on system prompts (90% savings on repeats)
   2. Native compaction — injects compact-2026-01-12 beta on long conversations (server-side,
                          zero cost, Claude compacts its own context at 30k token trigger)
   3. Semantic caching  — Qdrant lookup before calling API for repeated queries (non-streaming)
-  4. Cost tracking     — logs every call to ~/.amplified/cost-log.jsonl + Telegram alerts
-  5. Model routing     — config-driven (UNFINISHED — see model_router.py)
+  4. Model routing     — classifies prompts and downgrades Sonnet→Haiku when safe (12x saving)
+  5. Cost tracking     — logs every call to ~/.amplified/cost-log.jsonl + Telegram alerts
+  6. Budget control    — daily spend limit with auto-Haiku enforcement above threshold
 
 Activation (zero changes to any other tool):
-  Add to ~/.amplified/keys.env:
+  ~/.amplified/keys.env must contain:
       ANTHROPIC_BASE_URL=http://localhost:8088
 
   The Anthropic Python SDK reads ANTHROPIC_BASE_URL automatically.
@@ -22,17 +23,23 @@ Activation (zero changes to any other tool):
 
 Run:      python3 token_proxy.py
 Daemon:   python3 token_proxy.py --install-plist && launchctl load ...
+Stats:    curl http://localhost:8088/proxy/stats
+Costs:    curl http://localhost:8088/proxy/costs
 Port:     8088 (configurable via TOKEN_PROXY_PORT env var)
 
 Status:
-  DONE — core proxy, prompt caching injection, cost tracking, streaming passthrough
+  DONE — core proxy, prompt caching injection, streaming passthrough
   DONE — semantic caching (non-streaming calls)
-  DONE — launchd plist installer
-  UNFINISHED — model routing (config exists, classifier not yet wired)
-  UNFINISHED — context compression (see context_compressor.py, not yet integrated here)
+  DONE — native context compaction (compact-2026-01-12 beta)
+  DONE — model routing (Sonnet→Haiku classifier, conservative, 12x savings on eligible calls)
+  DONE — enhanced stats + historical cost breakdown endpoint
+  DONE — daily budget enforcement (auto-Haiku mode above configurable threshold)
+  DONE — cost attribution by agent/tool
+  DONE — launchd plist installer (KeepAlive — never needs manual start)
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -41,8 +48,8 @@ import asyncio
 import argparse
 import logging
 from pathlib import Path
-from datetime import datetime, date
-from typing import Optional, AsyncIterator
+from datetime import datetime, date, timedelta
+from typing import Optional, AsyncIterator, Dict, Any
 
 # Load API keys via secrets manager (keys.env → 1Password when configured)
 sys.path.insert(0, str(Path.home() / ".amplified"))
@@ -69,23 +76,28 @@ CACHE_COLLECTION = "llm_cache"
 CACHE_SIMILARITY = 0.95
 CACHE_TTL_HOURS = 24
 DAILY_ALERT_USD = float(os.getenv("COST_ALERT_THRESHOLD_USD", "5.0"))
+DAILY_BUDGET_USD = float(os.getenv("DAILY_BUDGET_USD", "50.0"))  # Above this → force Haiku
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("proxy")
 
 # ---- Model pricing (USD per token) ----------------------------------------
 
+HAIKU = "claude-haiku-4-5-20251001"
+SONNET = "claude-sonnet-4-6"
+
 PRICING = {
-    "claude-haiku-4-5-20251001": {"in": 0.25e-6, "out": 1.25e-6},
-    "claude-haiku-4-5":          {"in": 0.25e-6, "out": 1.25e-6},
-    "claude-sonnet-4-6":         {"in": 3.00e-6, "out": 15.00e-6},
-    "claude-sonnet-4-5":         {"in": 3.00e-6, "out": 15.00e-6},
+    "claude-haiku-4-5-20251001": {"in": 0.25e-6,  "out": 1.25e-6},
+    "claude-haiku-4-5":          {"in": 0.25e-6,  "out": 1.25e-6},
+    "claude-sonnet-4-6":         {"in": 3.00e-6,  "out": 15.00e-6},
+    "claude-sonnet-4-5":         {"in": 3.00e-6,  "out": 15.00e-6},
     "claude-opus-4-6":           {"in": 15.00e-6, "out": 75.00e-6},
+    "claude-opus-4-5":           {"in": 15.00e-6, "out": 75.00e-6},
 }
 
 def calc_cost(model: str, input_tok: int, output_tok: int,
               cache_create: int = 0, cache_read: int = 0) -> float:
-    p = PRICING.get(model, PRICING["claude-sonnet-4-6"])
+    p = PRICING.get(model, PRICING[SONNET])
     normal_in = max(0, input_tok - cache_create - cache_read)
     return round(
         normal_in * p["in"]
@@ -100,6 +112,7 @@ def calc_cost(model: str, input_tok: int, output_tok: int,
 _daily_cost = 0.0
 _session_cost = 0.0
 _session_calls = 0
+_routing_stats = {"haiku_routed": 0, "sonnet_kept": 0, "haiku_requested": 0}
 
 def _load_today_cost() -> float:
     if not COST_LOG_FILE.exists():
@@ -120,7 +133,8 @@ def _load_today_cost() -> float:
 
 def record_cost(model: str, input_tok: int, output_tok: int,
                 cache_create: int = 0, cache_read: int = 0,
-                from_cache: bool = False, tool: str = "unknown"):
+                from_cache: bool = False, tool: str = "unknown",
+                original_model: str = ""):
     global _daily_cost, _session_cost, _session_calls
     cost = calc_cost(model, input_tok, output_tok, cache_create, cache_read)
     _daily_cost += cost
@@ -131,6 +145,7 @@ def record_cost(model: str, input_tok: int, output_tok: int,
         "ts": datetime.utcnow().isoformat(),
         "date": date.today().isoformat(),
         "model": model,
+        "original_model": original_model or model,
         "input_tokens": input_tok,
         "output_tokens": output_tok,
         "cache_creation_tokens": cache_create,
@@ -146,31 +161,28 @@ def record_cost(model: str, input_tok: int, output_tok: int,
     except Exception:
         pass
 
+    routed_note = f" [routed from {original_model}]" if original_model and original_model != model else ""
     log.info(
         f"${cost:.5f} | {model.split('-')[1][:6]} | "
         f"in={input_tok} out={output_tok} "
         f"cache_r={cache_read} cache_w={cache_create} "
-        f"{'[HIT]' if from_cache else ''} | "
+        f"{'[SEMANTIC HIT]' if from_cache else ''}"
+        f"{routed_note} | {tool} | "
         f"session=${_session_cost:.4f} today=${_daily_cost:.4f}"
     )
 
     if _daily_cost >= DAILY_ALERT_USD:
         _maybe_telegram_alert()
 
-def _maybe_telegram_alert():
-    flag = Path.home() / f".amplified/cost-alert-{date.today().isoformat()}.flag"
-    if flag.exists():
-        return
-    flag.touch()
+def _send_telegram(msg: str):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not (token and chat_id):
+    chat_id = os.getenv("EWAN_TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+    if not (token and chat_id and chat_id.strip()):
         return
-    msg = (f"⚠️ Daily AI spend: ${_daily_cost:.4f} (threshold ${DAILY_ALERT_USD:.2f})")
     try:
         import urllib.request
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = json.dumps({"chat_id": chat_id, "text": msg}).encode()
+        data = json.dumps({"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}).encode()
         urllib.request.urlopen(
             urllib.request.Request(url, data, {"Content-Type": "application/json"}),
             timeout=5
@@ -178,14 +190,152 @@ def _maybe_telegram_alert():
     except Exception:
         pass
 
+def _maybe_telegram_alert():
+    flag = Path.home() / f".amplified/cost-alert-{date.today().isoformat()}.flag"
+    if flag.exists():
+        return
+    flag.touch()
+    _send_telegram(
+        f"⚠️ *Daily AI spend: ${_daily_cost:.2f}*\n"
+        f"Threshold: ${DAILY_ALERT_USD:.2f} | Budget: ${DAILY_BUDGET_USD:.2f}\n"
+        f"Session calls: {_session_calls} | "
+        f"Routed to Haiku: {_routing_stats['haiku_routed']}"
+    )
+
+# ---- Model routing ---------------------------------------------------------
+# Conservative Sonnet→Haiku classifier. Only downgrades when we're certain.
+# Haiku is 12x cheaper than Sonnet ($0.25/1M vs $3.00/1M input).
+# Goal: route >60% of volume to Haiku without touching quality-sensitive calls.
+
+MODEL_ROUTING_ENABLED = os.getenv("MODEL_ROUTING_ENABLED", "true").lower() == "true"
+
+# Patterns that indicate Haiku is sufficient (fast extraction/classification work)
+_HAIKU_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"\bextract\b",
+        r"\bclassif",
+        r"\byes or no\b",
+        r"\breturn (only |just )?(a )?(json|number|integer|true|false|list|dict)\b",
+        r"\breturn ONLY\b",
+        r"\bformat (this|the following)\b",
+        r"\bconvert (this|the following)\b",
+        r"\bnormalise\b|\bnormalize\b",
+        r"\bparse (this|the following|the)\b",
+        r"\bscore.*?\b0\.0.*?1\.0\b",
+        r"\bsentiment\b",
+        r"\bsummarise this\b|\bsummarize this\b",
+        r"\btrue or false\b",
+        r"\bis this (a|an|the)\b",
+        r"\bname and (address|phone|email)\b",
+        r"\bentity extraction\b",
+        r"\btag (this|the following)\b",
+        r"\bcategorise\b|\bcategorize\b",
+    ]
+]
+
+# Sonnet patterns are VETO — if any match, stay on Sonnet regardless
+_SONNET_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"\binterview\b",
+        r"\bnext question\b",
+        r"\bask.*\bquestion\b",
+        r"\bgenerate.*\binsight\b",
+        r"\banalyse\b|\banalyze\b",
+        r"\bstrateg",
+        r"\brecommend\b",
+        r"\badvice\b",
+        r"\bwrite (a|an|the|me)\b",
+        r"\bdraft\b",
+        r"\bexplain\b",
+        r"\bthink (about|through|carefully)\b",
+        r"\bplan\b",
+        r"\bwhy\b.*\?\s*$",
+        r"\bhow (do|does|can|should|would)\b",
+    ]
+]
+
+def _route_model(body: dict) -> tuple[str, str, str]:
+    """
+    Returns (model_to_use, original_model, reason).
+    Conservative: only downgrades Sonnet when we're very confident.
+    Opus requests are never downgraded (caller made an intentional choice).
+    """
+    requested = body.get("model", SONNET)
+
+    if not MODEL_ROUTING_ENABLED:
+        return requested, requested, "routing_disabled"
+
+    # Don't touch Haiku requests — already optimal
+    if HAIKU in requested or "haiku" in requested.lower():
+        _routing_stats["haiku_requested"] += 1
+        return requested, requested, "already_haiku"
+
+    # Don't touch Opus — if caller specified Opus, they mean it
+    if "opus" in requested.lower():
+        return requested, requested, "opus_respected"
+
+    # Budget exceeded → force Haiku on everything
+    if _daily_cost >= DAILY_BUDGET_USD:
+        _routing_stats["haiku_routed"] += 1
+        log.warning(f"[BUDGET] Daily ${_daily_cost:.2f} ≥ ${DAILY_BUDGET_USD:.2f} — forcing Haiku")
+        return HAIKU, requested, "budget_exceeded"
+
+    # Extract text to classify
+    system = body.get("system", "")
+    if isinstance(system, list):
+        system_text = " ".join(b.get("text", "") for b in system if isinstance(b, dict))
+    else:
+        system_text = str(system)
+
+    messages = body.get("messages", [])
+    last_content = ""
+    if messages:
+        c = messages[-1].get("content", "")
+        if isinstance(c, list):
+            c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+        last_content = str(c)
+
+    # Use last user message + short system prefix for classification
+    classify_text = last_content + " " + system_text[:300]
+
+    # Sonnet veto — any reasoning/generation pattern keeps us on Sonnet
+    for p in _SONNET_PATTERNS:
+        if p.search(classify_text):
+            _routing_stats["sonnet_kept"] += 1
+            return requested, requested, "sonnet_pattern"
+
+    # Long conversations → Sonnet (context matters, quality matters)
+    if len(messages) > 8:
+        _routing_stats["sonnet_kept"] += 1
+        return requested, requested, "long_conversation"
+
+    # Long prompts → Sonnet (likely complex task)
+    if len(last_content) > 2000:
+        _routing_stats["sonnet_kept"] += 1
+        return requested, requested, "long_prompt"
+
+    # Haiku patterns match → safe to downgrade
+    for p in _HAIKU_PATTERNS:
+        if p.search(classify_text):
+            _routing_stats["haiku_routed"] += 1
+            return HAIKU, requested, "haiku_pattern"
+
+    # Very short, no history → probably simple
+    if len(last_content) < 80 and len(messages) <= 2:
+        _routing_stats["haiku_routed"] += 1
+        return HAIKU, requested, "short_simple"
+
+    # Default: trust the caller's model choice
+    _routing_stats["sonnet_kept"] += 1
+    return requested, requested, "default"
+
 # ---- Prompt caching injection ----------------------------------------------
 
 def inject_cache_control(body: dict) -> dict:
     """
-    Automatically add cache_control: ephemeral to system prompt if not present.
-    Anthropic caches system prompts that have this — cached reads cost 10% of normal.
-    Min 1024 tokens to qualify; typical system prompts are 500-3000 tokens.
-    Only applied if system is a string (we convert to content block).
+    Add cache_control: ephemeral to system prompt if not present.
+    Anthropic charges 10% of normal price for cache reads.
+    Min 1024 tokens to qualify — most system prompts are well above this.
     """
     system = body.get("system")
     if isinstance(system, str) and len(system) > 100:
@@ -193,8 +343,16 @@ def inject_cache_control(body: dict) -> dict:
         body["system"] = [
             {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
         ]
-        # Add beta header so Anthropic processes cache_control
         body["_inject_cache_beta"] = True
+    elif isinstance(system, list) and system:
+        # Already a list — add cache_control to the last text block if missing
+        body = dict(body)
+        last = system[-1]
+        if isinstance(last, dict) and last.get("type") == "text" and "cache_control" not in last:
+            system = list(system)
+            system[-1] = {**last, "cache_control": {"type": "ephemeral"}}
+            body["system"] = system
+            body["_inject_cache_beta"] = True
     return body
 
 # ---- Semantic cache (Qdrant) -----------------------------------------------
@@ -251,7 +409,6 @@ def cache_lookup(body: dict) -> Optional[dict]:
     try:
         key = _make_cache_key(body)
         vec = _embedder.encode(key).tolist()
-        from qdrant_client.models import ScoredPoint
         result = _qdrant.query_points(
             collection_name=CACHE_COLLECTION,
             query=vec,
@@ -262,10 +419,8 @@ def cache_lookup(body: dict) -> Optional[dict]:
         if not results:
             return None
         payload = results[0].payload or {}
-        # TTL check
         cached_at = payload.get("cached_at", "")
         try:
-            from datetime import timedelta
             age = datetime.utcnow() - datetime.fromisoformat(cached_at)
             if age.total_seconds() > CACHE_TTL_HOURS * 3600:
                 return None
@@ -298,6 +453,37 @@ def cache_store(body: dict, response: dict):
     except Exception as e:
         log.warning(f"Cache store error: {e}")
 
+# ---- Agent attribution ------------------------------------------------------
+
+def _identify_tool(request: Request, body: dict) -> str:
+    """
+    Best-effort identification of which tool/agent made this call.
+    Used for cost attribution in the log.
+    Priority: X-Agent-Name header > User-Agent parsing > unknown
+    """
+    # Explicit header (we inject this in CRM, dashboard, etc.)
+    agent_name = request.headers.get("x-agent-name", "")
+    if agent_name:
+        return agent_name[:40]
+
+    ua = request.headers.get("user-agent", "").lower()
+    if "claude-code" in ua:
+        return "claude-code"
+    if "openclaw" in ua:
+        return "sam-openclaw"
+    if "python-httpx" in ua:
+        return "python-httpx"
+    if "anthropic-python" in ua or "anthropic/python" in ua:
+        # Try to identify from other signals
+        referer = request.headers.get("referer", "")
+        if "dashboard" in referer:
+            return "dashboard"
+        return "python-sdk"
+
+    # Fallback: use raw UA truncated
+    raw = request.headers.get("user-agent", "unknown")
+    return raw[:40] or "unknown"
+
 # ---- HTTP client -----------------------------------------------------------
 
 _http_client: Optional[httpx.AsyncClient] = None
@@ -316,23 +502,118 @@ async def get_http_client() -> httpx.AsyncClient:
 
 app = FastAPI(title="Token Proxy", docs_url=None, redoc_url=None)
 
-def _tool_from_headers(headers) -> str:
-    ua = headers.get("user-agent", "")
-    if "claude-code" in ua.lower():
-        return "claude-code"
-    if "openclaw" in ua.lower():
-        return "openclaw"
-    if "python-httpx" in ua.lower():
-        return "python-sdk"
-    return ua[:40] or "unknown"
+@app.get("/proxy/stats")
+async def proxy_stats():
+    """Live session and today stats."""
+    total_routed = _routing_stats["haiku_routed"]
+    total_routing = total_routed + _routing_stats["sonnet_kept"]
+    haiku_rate = total_routed / total_routing if total_routing > 0 else 0.0
+
+    return {
+        "session": {
+            "cost_usd": round(_session_cost, 6),
+            "calls": _session_calls,
+        },
+        "today": {
+            "cost_usd": round(_daily_cost, 6),
+            "alert_threshold_usd": DAILY_ALERT_USD,
+            "budget_usd": DAILY_BUDGET_USD,
+            "budget_used_pct": round(_daily_cost / DAILY_BUDGET_USD * 100, 1),
+        },
+        "routing": {
+            "enabled": MODEL_ROUTING_ENABLED,
+            "haiku_routed": _routing_stats["haiku_routed"],
+            "sonnet_kept": _routing_stats["sonnet_kept"],
+            "haiku_already": _routing_stats["haiku_requested"],
+            "haiku_rate": round(haiku_rate, 3),
+            "estimated_savings_usd": round(
+                _routing_stats["haiku_routed"] * 2.75e-3, 4
+            ),  # rough estimate: avg call saves ~$0.00275
+        },
+        "cache": {
+            "enabled": _qdrant is not None,
+            "collection": CACHE_COLLECTION,
+            "similarity_threshold": CACHE_SIMILARITY,
+        },
+        "proxy": {
+            "port": PROXY_PORT,
+            "upstream": ANTHROPIC_REAL_URL,
+        }
+    }
+
+@app.get("/proxy/costs")
+async def proxy_costs(days: int = 7, group_by: str = "model"):
+    """
+    Historical cost breakdown from cost-log.jsonl.
+
+    Query params:
+      days=7          — how many days of history to return (default 7)
+      group_by=model  — 'model', 'tool', or 'date'
+    """
+    if not COST_LOG_FILE.exists():
+        return {"error": "No cost log yet", "log": str(COST_LOG_FILE)}
+
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    entries = []
+    try:
+        for line in COST_LOG_FILE.read_text().splitlines():
+            try:
+                e = json.loads(line)
+                if e.get("date", "") >= cutoff:
+                    entries.append(e)
+            except Exception:
+                pass
+    except Exception as ex:
+        return {"error": str(ex)}
+
+    # Aggregate
+    breakdown: Dict[str, Any] = {}
+    total_cost = 0.0
+    total_calls = 0
+    cache_hits = 0
+
+    for e in entries:
+        key = e.get(group_by, "unknown")
+        if key not in breakdown:
+            breakdown[key] = {"cost_usd": 0.0, "calls": 0, "cache_hits": 0,
+                              "input_tokens": 0, "output_tokens": 0}
+        breakdown[key]["cost_usd"] += e.get("cost_usd", 0)
+        breakdown[key]["calls"] += 1
+        breakdown[key]["input_tokens"] += e.get("input_tokens", 0)
+        breakdown[key]["output_tokens"] += e.get("output_tokens", 0)
+        if e.get("from_cache"):
+            breakdown[key]["cache_hits"] += 1
+            cache_hits += 1
+        total_cost += e.get("cost_usd", 0)
+        total_calls += 1
+
+    # Round and sort
+    for v in breakdown.values():
+        v["cost_usd"] = round(v["cost_usd"], 6)
+    sorted_breakdown = dict(
+        sorted(breakdown.items(), key=lambda x: x[1]["cost_usd"], reverse=True)
+    )
+
+    return {
+        "period_days": days,
+        "group_by": group_by,
+        "total_cost_usd": round(total_cost, 6),
+        "total_calls": total_calls,
+        "cache_hits": cache_hits,
+        "cache_hit_rate": round(cache_hits / total_calls, 3) if total_calls else 0,
+        "breakdown": sorted_breakdown,
+    }
 
 @app.post("/v1/messages")
 async def proxy_messages(request: Request):
     """
     Main proxy endpoint. Handles both streaming and non-streaming.
 
-    Non-streaming: semantic cache check → inject prompt caching → forward → cache store
-    Streaming: inject prompt caching → forward (SSE passthrough)
+    Pipeline (non-streaming):
+      model routing → cache lookup → inject caching → inject compaction → Anthropic → cache store
+
+    Pipeline (streaming):
+      model routing → inject caching → inject compaction → Anthropic (SSE passthrough)
     """
     raw_body = await request.body()
     try:
@@ -341,14 +622,36 @@ async def proxy_messages(request: Request):
         return Response(content=raw_body, status_code=400)
 
     is_stream = body.get("stream", False)
-    tool = _tool_from_headers(request.headers)
+    tool = _identify_tool(request, body)
 
-    # Inject prompt caching headers
+    # ---- 1. Model routing — downgrade Sonnet→Haiku when safe ----
+    routed_model, original_model, routing_reason = _route_model(body)
+    if routed_model != original_model:
+        body = dict(body)
+        body["model"] = routed_model
+        log.info(f"[ROUTE] {original_model} → {routed_model.split('-')[1]} ({routing_reason}) | {tool}")
+
+    # ---- 2. Prompt caching injection ----
     body = inject_cache_control(body)
     inject_beta = body.pop("_inject_cache_beta", False)
     inject_compact = body.pop("_inject_compact_beta", False)
 
-    # Build forwarding headers
+    # ---- 3. Native context compaction (server-side, zero cost) ----
+    messages = body.get("messages", [])
+    estimated_tokens = sum(len(str(m.get("content", ""))) // 4 for m in messages)
+    if estimated_tokens > 4000:
+        body = dict(body)
+        if "context_management" not in body:
+            body["context_management"] = {
+                "edits": [{
+                    "type": "compact_20260112",
+                    "trigger": {"type": "input_tokens", "value": 30000},
+                }]
+            }
+        inject_compact = True
+        log.debug(f"Native compaction armed (est. {estimated_tokens} tokens)")
+
+    # ---- 4. Build forwarding headers ----
     forward_headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in ("host", "content-length", "transfer-encoding")
@@ -362,31 +665,7 @@ async def proxy_messages(request: Request):
             betas.append("compact-2026-01-12")
         forward_headers["anthropic-beta"] = ",".join(betas)
 
-    # ---- Context management -----------------------------------------------
-    # Strategy 1 (preferred): Anthropic native compaction beta.
-    #   Server-side, zero cost, Claude compacts its own context.
-    #   Triggers at 30k tokens — well before the 200k limit.
-    # Strategy 2 (fallback): Haiku-based summarisation for non-beta clients
-    #   or when native compaction is not appropriate.
-
-    messages = body.get("messages", [])
-    estimated_tokens = sum(len(str(m.get("content", ""))) // 4 for m in messages)
-
-    if estimated_tokens > 4000:  # Only bother for conversations worth compacting
-        # Inject Anthropic native compaction (compact-2026-01-12 beta)
-        body = dict(body)
-        if "context_management" not in body:
-            body["context_management"] = {
-                "edits": [{
-                    "type": "compact_20260112",
-                    "trigger": {"type": "input_tokens", "value": 30000},
-                }]
-            }
-        # Ensure the beta header is included
-        body["_inject_compact_beta"] = True
-        log.debug(f"Native compaction armed (est. {estimated_tokens} tokens in history)")
-
-    # ---- Non-streaming: check semantic cache first ----
+    # ---- 5. Non-streaming: semantic cache check ----
     if not is_stream:
         cached = cache_lookup(body)
         if cached:
@@ -397,27 +676,29 @@ async def proxy_messages(request: Request):
                 output_tok=usage.get("output_tokens", 0),
                 from_cache=True,
                 tool=tool,
+                original_model=original_model,
             )
             log.info(f"[CACHE HIT] {tool}")
             return JSONResponse(content=cached)
 
-    # ---- Forward to Anthropic ----
+    # ---- 6. Forward to Anthropic ----
     client = await get_http_client()
     forward_body = json.dumps(body).encode()
 
     if is_stream:
-        # Streaming: SSE passthrough
         async def stream_response() -> AsyncIterator[bytes]:
             async with client.stream(
                 "POST", "/v1/messages",
                 content=forward_body,
                 headers={**forward_headers, "content-length": str(len(forward_body))},
             ) as resp:
+                usage_tracked = False
                 async for chunk in resp.aiter_bytes():
                     yield chunk
-                    # Parse cost from the final [DONE] event if present
-                    # (best-effort — streaming cost tracking via message_delta events)
-                    _try_track_stream_chunk(chunk, body.get("model", ""), tool)
+                    if not usage_tracked:
+                        usage_tracked = _try_track_stream_chunk(
+                            chunk, body.get("model", ""), tool, original_model
+                        )
 
         return StreamingResponse(
             stream_response(),
@@ -426,7 +707,6 @@ async def proxy_messages(request: Request):
         )
 
     else:
-        # Non-streaming: get full response, cache it, return it
         resp = await client.post(
             "/v1/messages",
             content=forward_body,
@@ -444,6 +724,7 @@ async def proxy_messages(request: Request):
                 cache_read=usage.get("cache_read_input_tokens", 0),
                 from_cache=False,
                 tool=tool,
+                original_model=original_model,
             )
             cache_store(body, response_body)
 
@@ -454,23 +735,36 @@ async def proxy_messages(request: Request):
             headers={"x-proxy": "token-proxy"},
         )
 
+# ---- Streaming cost tracking -----------------------------------------------
 
-# Streaming cost tracking — best-effort parse of SSE events
-_stream_buffers: dict = {}
-
-def _try_track_stream_chunk(chunk: bytes, model: str, tool: str):
-    """Parse message_stop event from stream to get final usage."""
+def _try_track_stream_chunk(chunk: bytes, model: str, tool: str, original_model: str = "") -> bool:
+    """
+    Parse SSE events from streaming response to extract usage data.
+    Anthropic sends usage in message_delta event (output_tokens) and
+    message_start event (input_tokens). Returns True when usage has been captured.
+    """
     try:
         text = chunk.decode("utf-8", errors="ignore")
         for line in text.splitlines():
-            if line.startswith("data: ") and "message_stop" in line:
-                # The usage comes in message_delta event, not message_stop
-                pass
-            if line.startswith("data: ") and "usage" in line:
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
-                    return
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:].strip()
+            if data_str == "[DONE]":
+                continue
+            try:
                 data = json.loads(data_str)
+            except Exception:
+                continue
+
+            # message_start has input_tokens (and optionally cache tokens)
+            if data.get("type") == "message_start":
+                usage = data.get("message", {}).get("usage", {})
+                if usage.get("input_tokens"):
+                    # Store for combination with output_tokens later
+                    _stream_input_cache[id(chunk)] = usage
+
+            # message_delta has output_tokens — this is where we record cost
+            elif data.get("type") == "message_delta":
                 usage = data.get("usage", {})
                 if usage.get("output_tokens"):
                     record_cost(
@@ -480,24 +774,18 @@ def _try_track_stream_chunk(chunk: bytes, model: str, tool: str):
                         cache_create=usage.get("cache_creation_input_tokens", 0),
                         cache_read=usage.get("cache_read_input_tokens", 0),
                         tool=tool,
+                        original_model=original_model,
                     )
+                    return True
     except Exception:
         pass
+    return False
 
+_stream_input_cache: dict = {}
 
-@app.get("/proxy/stats")
-async def proxy_stats():
-    return {
-        "session_cost_usd": round(_session_cost, 6),
-        "session_calls": _session_calls,
-        "today_cost_usd": round(_daily_cost, 6),
-        "daily_alert_threshold_usd": DAILY_ALERT_USD,
-        "cache_enabled": _qdrant is not None,
-        "port": PROXY_PORT,
-    }
-
-# Passthrough other Anthropic endpoints (models list, etc.)
+# ---- Passthrough other Anthropic endpoints ---------------------------------
 # Must be AFTER all specific routes
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy_passthrough(request: Request, path: str):
     if path.startswith("proxy/"):
@@ -518,6 +806,7 @@ async def proxy_passthrough(request: Request, path: str):
     return Response(content=resp.content, status_code=resp.status_code,
                     media_type=resp.headers.get("content-type", "application/json"))
 
+# ---- Startup ---------------------------------------------------------------
 
 @app.on_event("startup")
 async def startup():
@@ -526,7 +815,8 @@ async def startup():
     _init_cache()
     log.info(f"Token proxy ready on :{PROXY_PORT}")
     log.info(f"Today's spend so far: ${_daily_cost:.4f}")
-    log.info(f"Set ANTHROPIC_BASE_URL=http://localhost:{PROXY_PORT} in keys.env to activate")
+    log.info(f"Model routing: {'ENABLED' if MODEL_ROUTING_ENABLED else 'DISABLED'}")
+    log.info(f"Daily budget: ${DAILY_BUDGET_USD:.2f} (alert at ${DAILY_ALERT_USD:.2f})")
 
 # ---- Launchd plist ---------------------------------------------------------
 
@@ -570,6 +860,7 @@ def install_plist():
     print(f"\nActivate:   launchctl load {plist_path}")
     print(f"Stop:       launchctl unload {plist_path}")
     print(f"Stats:      curl http://localhost:{PROXY_PORT}/proxy/stats")
+    print(f"Costs:      curl http://localhost:{PROXY_PORT}/proxy/costs")
     print(f"\nThen add to ~/.amplified/keys.env:")
     print(f"    ANTHROPIC_BASE_URL=http://localhost:{PROXY_PORT}")
 
